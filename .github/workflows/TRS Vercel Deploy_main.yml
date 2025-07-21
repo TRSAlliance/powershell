@@ -1,0 +1,84 @@
+name: TRS Vercel Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DEPLOY_ENV: ${{ contains(github.ref, 'prod') && 'production' || 'staging' }}
+  FIREBASE_PROJECT: ghostshift-${{ contains(github.ref, 'prod') && 'd5f46' || 'staging' }}
+  BUILD_DIR: ./dist
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    environment: ${{ env.DEPLOY_ENV }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PowerShell
+        shell: bash
+        run: |
+          wget -q https://packages.microsoft.com/config/ubuntu/20.04/packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update
+          sudo apt-get install -y powershell
+
+      - name: Verify TRS Trust Signal
+        shell: pwsh
+        run: |
+          Import-Module ./modules/TRSCore/TRSCore.psm1
+          Invoke-TRSTrustCheck -Operation "deploy"
+        env:
+          TRS_TRUST_KEY: ${{ secrets.TRS_TRUST_KEY_v2 }}
+
+      - name: Verify Stevedoring Signals
+        run: npx ts-node src/simulate_signal.ts
+        env:
+          FIREBASE_PROJECT_ID: ${{ env.FIREBASE_PROJECT }}
+          TRS_FIREBASE_TOKEN: ${{ secrets.TRS_FIREBASE_TOKEN }}
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ env.DEPLOY_ENV }}
+    outputs:
+      firebase-url: ${{ steps.deploy.outputs.firebase-url }}
+      vercel-url: ${{ steps.deploy.outputs.vercel-url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PowerShell
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y powershell
+
+      - name: Run TRS Deploy Script
+        id: deploy
+        shell: pwsh
+        run: ./scripts/trs-deploy.ps1 -Environment ${{ env.DEPLOY_ENV }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          TRS_FIREBASE_TOKEN: ${{ secrets.TRS_FIREBASE_TOKEN }}
+          TRS_TRUST_KEY: ${{ secrets.TRS_TRUST_KEY_v2 }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL_v2 }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY_v2 }}
+
+      - name: Sync Databases
+        shell: pwsh
+        run: ./scripts/sync-databases.ps1 -SourceDB supabase -TargetDB neon
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL_v2 }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+
+      - name: Signal War Room
+        if: always()
+        run: node .github/scripts/warroom-alert.js
+        env:
+          TRS_WARROOM_WEBHOOK: ${{ secrets.TRS_WARROOM_WEBHOOK }}
+          status: ${{ job.status }}
+          commit: ${{ github.sha }}
+          urls: ${{ toJSON({ firebase: steps.deploy.outputs.firebase-url || 'Failed', vercel: steps.deploy.outputs.vercel-url || 'Failed' }) }}
+```
